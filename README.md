@@ -8,11 +8,11 @@ I created this for my own very niche use case where I have a Unifi network with 
 
 I could avoid all this hassle by disabling the VLAN tagging on my server and setting the Unifi port to default to VLAN10, but then I'd have to redo all the networking on my server and I don't want to do that since I only use this adapter occasionally to transfer large files quickly. Otherwise I just connect over wifi at sub-1gbit speeds.
 
-So instead of all that I vibe-coded this thing with Claude Code. Code written by Claude, reviewed/cleaned up by me. Since this is basically all AI written (except this README section), I've used the Unlicense to make it public domain.
+So instead of all that I vibe-coded this thing with Claude Code. Code written by Claude; reviewed, cleaned up, and tested by me. Since this is basically all AI written (except this README section), I've used the Unlicense to make it public domain.
 
 ## Overview
 
-This daemon runs in the background and monitors for the specific WisdPi USB 5G Ethernet adapter. When it is detected, it automatically:
+This daemon runs in the background and monitors for the specific WisdPi USB 5G Ethernet adapter. When the adapter is detected, it automatically:
 
 1. Creates a VLAN interface (`vlan10`)
 2. Configures VLAN 10 on the detected USB network interface
@@ -20,12 +20,19 @@ This daemon runs in the background and monitors for the specific WisdPi USB 5G E
 4. Configures DHCP on the VLAN interface
 5. Sets MTU to 1450
 
+When the adapter is unplugged, it automatically:
+
+1. Destroys the VLAN interface (`vlan10`)
+2. Cleans up all tracked configuration state
+
 The daemon starts automatically on boot and runs invisibly in the background with root privileges.
 
 ## Features
 
 - **Specific Device Detection**: Only detects and configures the WisdPi USB 5G Ethernet adapter (VID:3034 PID:33111)
-- **Automatic Detection**: Detects the adapter within seconds of being plugged in
+- **Event-Driven Detection**: Instantly detects the adapter when plugged in using IOKit notifications (no polling)
+- **Automatic Cleanup**: Automatically removes VLAN interface when adapter is unplugged
+- **Battery Friendly**: Zero CPU usage when idle - only wakes up on device connection/removal
 - **Auto-start**: Launches automatically on system boot via LaunchDaemon
 - **Background Operation**: Runs invisibly with no user interaction required
 - **Robust**: Restarts automatically if it crashes
@@ -120,7 +127,6 @@ struct DaemonConfig {
     static let targetProductID: Int = 33111 // USB Product ID
 
     // Detection timing
-    static let pollInterval: TimeInterval = 1.0              // Check interval (seconds)
     static let stabilizationDelay: TimeInterval = 2.0        // Wait before configuring
 }
 ```
@@ -328,21 +334,27 @@ ifconfig vlan10 | grep vlanpif
 ### Architecture
 
 - **Language**: Swift
-- **Frameworks**: Foundation, SystemConfiguration
-- **Detection Method**: Polling SystemConfiguration for new network interfaces
+- **Frameworks**: Foundation, SystemConfiguration, IOKit
+- **Detection Method**: IOKit USB device notifications (event-driven, no polling)
 - **Execution**: LaunchDaemon running as root
 - **Logging**: Standard output/error to `/var/log/`
 
 ### How It Works
 
 1. Daemon starts on system boot via LaunchDaemon
-2. Initializes list of currently known network interfaces
-3. Polls every second for new interfaces using SystemConfiguration framework
-4. Identifies new Ethernet interfaces and checks USB vendor/product ID using IOKit
-5. Only proceeds if the device matches WisdPi USB 5G Ethernet (VID:3034 PID:33111)
-6. Waits 2 seconds for driver stabilization
-7. Executes VLAN configuration commands as root
-8. Tracks configured interfaces to avoid duplicate configuration
+2. Sets up IOKit notifications for USB device arrival and removal matching WisdPi USB 5G Ethernet (VID:3034 PID:33111)
+3. Waits idle until the target USB device is plugged in (no CPU usage)
+4. **On device connection:**
+   - Receives instant notification when the target device is connected
+   - Waits 2 seconds for network driver stabilization
+   - Traverses IOKit registry to find the exact BSD name (e.g., en15) for the USB device
+   - Executes VLAN configuration commands as root
+   - Tracks configured interface to avoid duplicate configuration
+5. **On device removal:**
+   - Receives instant notification when the target device is unplugged
+   - Destroys the VLAN interface
+   - Clears all tracked configuration state
+6. Returns to idle state, waiting for next device connection
 
 ### Security Considerations
 
@@ -384,9 +396,8 @@ For issues or questions:
 Potential improvements:
 - Configuration file (JSON/plist) instead of hardcoded values
 - Support for multiple USB adapters with different configurations
-- Notification when VLAN is configured
+- User notification when VLAN is configured/removed
 - Web interface for configuration
-- Automatic cleanup when adapter is unplugged (though macOS handles this)
 
 ---
 

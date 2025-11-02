@@ -19,107 +19,173 @@ struct DaemonConfig {
     static let targetVendorID: Int = 3034   // 0x0BDA (WisdPi)
     static let targetProductID: Int = 33111 // 0x8157 (USB 5G Ethernet)
 
-    // Poll interval for checking new interfaces (in seconds)
-    static let pollInterval: TimeInterval = 1.0
-
     // Wait time after detection before configuring (allows driver to stabilize)
     static let stabilizationDelay: TimeInterval = 2.0
 }
 
+// MARK: - Logging
+func log(_ message: String) {
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    print("[\(timestamp)] \(message)")
+    fflush(stdout)
+}
+
+// MARK: - IOKit Callbacks
+
+func deviceAdded(refCon: UnsafeMutableRawPointer?, iterator: io_iterator_t) {
+    guard let refCon = refCon else {
+        // This should never happen
+        log("ERROR: refCon is nil in deviceAdded, can't get reference to NetworkInterfaceManager to call handleDeviceAdded()")
+        return
+    }
+
+    let manager = Unmanaged<NetworkInterfaceManager>.fromOpaque(refCon).takeUnretainedValue()
+    manager.handleDeviceAdded()
+}
+
+func deviceRemoved(refCon: UnsafeMutableRawPointer?, iterator: io_iterator_t) {
+    guard let refCon = refCon else {
+        log("ERROR: refCon is nil in deviceRemoved, can't get reference to NetworkInterfaceManager to call handleDeviceRemoved()")
+        return
+    }
+
+    let manager = Unmanaged<NetworkInterfaceManager>.fromOpaque(refCon).takeUnretainedValue()
+    manager.handleDeviceRemoved()
+}
+
 // MARK: - Network Interface Manager
 class NetworkInterfaceManager {
-    private var knownInterfaces: Set<String> = []
     private var configuredInterfaces: Set<String> = []
-    private var timer: Timer?
+    private var interfaceToBSDName: [String: String] = [:] // Track which BSD name we configured
+    private var notificationPort: IONotificationPortRef?
+    private var addedIterator: io_iterator_t = 0
+    private var removedIterator: io_iterator_t = 0
 
     init() {
         log("USB 5Gbit Auto VLAN10 Daemon started")
-        log("Monitoring for 5Gbit USB Ethernet adapters...")
-
-        // Initialize known interfaces
-        updateKnownInterfaces()
+        log("Monitoring for 5Gbit USB Ethernet adapters using IOKit notifications...")
     }
 
     func start() {
-        // Start monitoring for new interfaces
-        timer = Timer.scheduledTimer(
-            withTimeInterval: DaemonConfig.pollInterval,
-            repeats: true
-        ) { [weak self] _ in
-            self?.checkForNewInterfaces()
-        }
+        // Set up IOKit notification for USB device matching our vendor/product ID
+        setupUSBNotifications()
 
         // Keep the daemon running
         RunLoop.main.run()
     }
 
-    private func updateKnownInterfaces() {
-        knownInterfaces = Set(getCurrentInterfaces())
-        log("Currently known interfaces: \(knownInterfaces.sorted().joined(separator: ", "))")
+    private func setupUSBNotifications() {
+        // Create a notification port and add it to the run loop
+        notificationPort = IONotificationPortCreate(kIOMainPortDefault)
+        guard let notificationPort = notificationPort else {
+            log("ERROR: Failed to create IONotificationPort")
+            return
+        }
+
+        let runLoopSource = IONotificationPortGetRunLoopSource(notificationPort).takeUnretainedValue()
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .defaultMode)
+
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+
+        // Set up notification for device arrival
+        let matchingDictAdded = IOServiceMatching(kIOUSBDeviceClassName) as NSMutableDictionary
+        matchingDictAdded[kUSBVendorID] = DaemonConfig.targetVendorID
+        matchingDictAdded[kUSBProductID] = DaemonConfig.targetProductID
+
+        let addResult = IOServiceAddMatchingNotification(
+            notificationPort,
+            kIOFirstMatchNotification,
+            matchingDictAdded,
+            deviceAdded,
+            selfPtr,
+            &addedIterator
+        )
+
+        guard addResult == KERN_SUCCESS else {
+            log("ERROR: Failed to add matching notification for device arrival: \(addResult)")
+            return
+        }
+
+        // Process any devices that are already connected
+        processExistingDevices(iterator: addedIterator)
+
+        // Set up notification for device removal
+        let matchingDictRemoved = IOServiceMatching(kIOUSBDeviceClassName) as NSMutableDictionary
+        matchingDictRemoved[kUSBVendorID] = DaemonConfig.targetVendorID
+        matchingDictRemoved[kUSBProductID] = DaemonConfig.targetProductID
+
+        let removeResult = IOServiceAddMatchingNotification(
+            notificationPort,
+            kIOTerminatedNotification,
+            matchingDictRemoved,
+            deviceRemoved,
+            selfPtr,
+            &removedIterator
+        )
+
+        guard removeResult == KERN_SUCCESS else {
+            log("ERROR: Failed to add matching notification for device removal: \(removeResult)")
+            return
+        }
+
+        // Process the removal iterator to arm it
+        processExistingDevices(iterator: removedIterator)
+
+        log("IOKit notifications setup complete (monitoring both arrival and removal)")
     }
 
-    private func getCurrentInterfaces() -> [String] {
-        var interfaces: [String] = []
-
-        // Get all network interfaces from SystemConfiguration
-        guard let allInterfaces = SCNetworkInterfaceCopyAll() as? [SCNetworkInterface] else {
-            return interfaces
+    private func processExistingDevices(iterator: io_iterator_t) {
+        while case let device = IOIteratorNext(iterator), device != 0 {
+            IOObjectRelease(device)
         }
-
-        for interface in allInterfaces {
-            if let bsdName = SCNetworkInterfaceGetBSDName(interface) as String? {
-                interfaces.append(bsdName)
-            }
-        }
-
-        return interfaces
     }
 
-    private func checkForNewInterfaces() {
-        let currentInterfaces = Set(getCurrentInterfaces())
-        let newInterfaces = currentInterfaces.subtracting(knownInterfaces)
+    func handleDeviceAdded() {
+        // Process the notification iterator
+        while case let device = IOIteratorNext(addedIterator), device != 0 {
+            log("Target USB device detected (VID:\(DaemonConfig.targetVendorID) PID:\(DaemonConfig.targetProductID))")
 
-        for interface in newInterfaces {
-            if isCorrectUSBEthernetInterface(interface) && !configuredInterfaces.contains(interface) {
-                log("New USB Ethernet interface detected: \(interface)")
-
-                // Wait for interface to stabilize before configuring
-                DispatchQueue.main.asyncAfter(deadline: .now() + DaemonConfig.stabilizationDelay) { [weak self] in
-                    self?.configureVLAN(for: interface)
-                }
-
-                configuredInterfaces.insert(interface)
+            // Wait for the network interface to appear and stabilize
+            DispatchQueue.main.asyncAfter(deadline: .now() + DaemonConfig.stabilizationDelay) { [weak self] in
+                self?.findAndConfigureNetworkInterface()
             }
-        }
 
-        // Update known interfaces
-        knownInterfaces = currentInterfaces
+            IOObjectRelease(device)
+        }
     }
 
-    private func isCorrectUSBEthernetInterface(_ bsdName: String) -> Bool {
-        // First check if it's an Ethernet interface
-        guard let allInterfaces = SCNetworkInterfaceCopyAll() as? [SCNetworkInterface] else {
-            return false
+    func handleDeviceRemoved() {
+        // Process the notification iterator
+        while case let device = IOIteratorNext(removedIterator), device != 0 {
+            log("Target USB device removed (VID:\(DaemonConfig.targetVendorID) PID:\(DaemonConfig.targetProductID))")
+
+            // Clean up the VLAN interface
+            cleanupVLAN()
+
+            IOObjectRelease(device)
+        }
+    }
+
+    private func findAndConfigureNetworkInterface() {
+        // Find the BSD name of the network interface that belongs to our USB device
+        guard let bsdName = findBSDNameForUSBDevice() else {
+            log("WARNING: USB device detected but no matching network interface found yet")
+            return
         }
 
-        var isEthernet = false
-        for interface in allInterfaces {
-            if let name = SCNetworkInterfaceGetBSDName(interface) as String?,
-               name == bsdName {
-                let interfaceType = SCNetworkInterfaceGetInterfaceType(interface) as String?
-                if interfaceType == "Ethernet" {
-                    isEthernet = true
-                    break
-                }
-            }
+        // Skip already configured interfaces
+        if configuredInterfaces.contains(bsdName) {
+            log("Interface \(bsdName) already configured, skipping")
+            return
         }
 
-        if !isEthernet {
-            return false
-        }
+        log("Found network interface \(bsdName) for target USB device")
+        configureVLAN(for: bsdName)
+        configuredInterfaces.insert(bsdName)
+    }
 
-        // Now check if it's the specific USB device we're looking for
-        // Query IOKit for USB devices matching our vendor/product ID
+    private func findBSDNameForUSBDevice() -> String? {
+        // Find our target USB device
         let matchingDict = IOServiceMatching(kIOUSBDeviceClassName) as NSMutableDictionary
         matchingDict[kUSBVendorID] = DaemonConfig.targetVendorID
         matchingDict[kUSBProductID] = DaemonConfig.targetProductID
@@ -128,22 +194,73 @@ class NetworkInterfaceManager {
         let result = IOServiceGetMatchingServices(kIOMainPortDefault, matchingDict, &iterator)
 
         guard result == KERN_SUCCESS else {
-            return false
+            log("ERROR: Failed to get matching USB services")
+            return nil
         }
 
         defer {
             IOObjectRelease(iterator)
         }
 
-        // Check if we found any matching USB devices
         let usbDevice = IOIteratorNext(iterator)
-        if usbDevice != 0 {
-            IOObjectRelease(usbDevice)
-            log("Interface \(bsdName) identified as target WisdPi USB 5G Ethernet (VID:\(DaemonConfig.targetVendorID) PID:\(DaemonConfig.targetProductID))")
-            return true
+        guard usbDevice != 0 else {
+            log("ERROR: Target USB device not found")
+            return nil
         }
 
-        return false
+        defer {
+            IOObjectRelease(usbDevice)
+        }
+
+        // Traverse down the IOKit registry to find the network interface
+        // The path is typically: USBDevice -> IOUSBHostInterface -> IOEthernetInterface -> BSD Name
+        return findBSDNameInChildren(of: usbDevice)
+    }
+
+    private func findBSDNameInChildren(of service: io_service_t) -> String? {
+        // Check if this service has a BSD name
+        if let bsdName = getPropertyString(service: service, key: "BSD Name") {
+            log("Found BSD Name: \(bsdName)")
+            return bsdName
+        }
+
+        // Search children recursively
+        var childIterator: io_iterator_t = 0
+        let result = IORegistryEntryGetChildIterator(service, kIOServicePlane, &childIterator)
+
+        guard result == KERN_SUCCESS else {
+            return nil
+        }
+
+        defer {
+            IOObjectRelease(childIterator)
+        }
+
+        while case let child = IOIteratorNext(childIterator), child != 0 {
+            defer {
+                IOObjectRelease(child)
+            }
+
+            if let bsdName = findBSDNameInChildren(of: child) {
+                return bsdName
+            }
+        }
+
+        return nil
+    }
+
+    private func getPropertyString(service: io_service_t, key: String) -> String? {
+        guard let property = IORegistryEntryCreateCFProperty(service, key as CFString, kCFAllocatorDefault, 0) else {
+            return nil
+        }
+
+        let value = property.takeRetainedValue()
+
+        if CFGetTypeID(value) == CFStringGetTypeID() {
+            return value as? String
+        }
+
+        return nil
     }
 
     private func configureVLAN(for interface: String) {
@@ -187,6 +304,28 @@ class NetworkInterfaceManager {
         log("VLAN configuration complete for \(interface)")
     }
 
+    private func cleanupVLAN() {
+        log("Cleaning up VLAN interface: \(DaemonConfig.vlanInterface)")
+
+        // Destroy the VLAN interface
+        let result = executeCommand("/sbin/ifconfig", arguments: [DaemonConfig.vlanInterface, "destroy"])
+
+        if result.success {
+            log("Successfully destroyed VLAN interface \(DaemonConfig.vlanInterface)")
+        } else {
+            // Don't log an error if the interface doesn't exist (which is fine)
+            if !result.error.contains("does not exist") && !result.error.isEmpty {
+                log("Error destroying VLAN interface: \(result.error)")
+            } else {
+                log("VLAN interface \(DaemonConfig.vlanInterface) already removed or doesn't exist")
+            }
+        }
+
+        // Clear our tracking
+        configuredInterfaces.removeAll()
+        interfaceToBSDName.removeAll()
+    }
+
     private func executeCommand(_ command: String, arguments: [String]) -> (success: Bool, output: String, error: String) {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: command)
@@ -212,12 +351,6 @@ class NetworkInterfaceManager {
         } catch {
             return (false, "", "Failed to execute: \(error.localizedDescription)")
         }
-    }
-
-    private func log(_ message: String) {
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-        print("[\(timestamp)] \(message)")
-        fflush(stdout)
     }
 }
 
