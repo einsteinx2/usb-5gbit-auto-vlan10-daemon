@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Unique identifier for this daemon -->
+    <key>Label</key>
+    <string>com.local.usb-5gbit-auto-vlan10-daemon</string>
+
+    <!-- Path to the daemon executable -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/usb-5gbit-auto-vlan10-daemon</string>
+    </array>
+
+    <!-- Start the daemon automatically when the system boots -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Keep the daemon running (restart if it crashes) -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Standard output log file -->
+    <key>StandardOutPath</key>
+    <string>/var/log/usb-5gbit-auto-vlan10-daemon.log</string>
+
+    <!-- Standard error log file -->
+    <key>StandardErrorPath</key>
+    <string>/var/log/usb-5gbit-auto-vlan10-daemon-error.log</string>
+
+    <!-- Run as root (required for network interface configuration) -->
+    <!-- Note: No UserName key means the daemon runs as root -->
+
+    <!-- Environment variables (optional) -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Set process type to avoid being killed during system sleep -->
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <!-- Nice value (priority) - 0 is normal -->
+    <key>Nice</key>
+    <integer>0</integer>
+
+    <!-- Restart throttle interval (10 seconds) -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>
